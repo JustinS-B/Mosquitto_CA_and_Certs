@@ -1,0 +1,165 @@
+#!/bin/bash
+
+# This creates a very slimline CA and Server cert with a full SAN multihost server.
+# The Mosquitto server requires keys and certs in PEM format, but it also exports
+# the CA Cert in DER for use in clients such as the Pico W
+
+# You will probably need to change this for your system
+mosquitto_dir="/etc/mosquitto"
+
+# Note: Pico W can use EC or RSA keys only, not EC25519, and Tasmota can only use 2048 bit RSA keys.
+
+# Choice of Key Types: RSA, EC, or ED25519
+key_type='EC'
+
+# Choice of NIST Curves for EC Keys: P-256, P-384 or P-521
+curve='P-256'
+
+# Choice of Bits for RSA Keys: 2048 or 4096
+rsa_bits='2048'
+
+# Choice to encrypt the CA Key or not? either BLANK or cypher (preferably aes-256-cbc) 
+encryption=''
+#encryption='-aes-256-cbc'
+
+# Multiple DNS names and IP Addresses. Note mbedtls can't currently use data from IP fields, 
+# but can read an IP from a DNS field, to the same effect.
+# Use as many unique names as you need, in the format DNS.1, DNS.2, DNS.3, IP.1, IP.2 etc.
+subjectAltName='DNS.1:server_name,DNS.2:server_name.example.com,DNS.3:192.168.1.1,IP.1:192.168.1.1'
+
+# NOTE: If you need to create one or more client Keys and Certs in either PEM or DER format,
+# you can call the 'client_maker' script one or more times at the bottom of this script, so 
+# just scroll right to the end to add the details. You can call 'client_maker' independantly
+# whenever you need more clients.
+
+############################################################
+#   End of user defined variables
+############################################################
+
+
+# Set the algorithm
+algorithm="-algorithm ${key_type}"
+
+# Set the specific pkeyopt for the chosen algorithm (BLANK for ED25519)
+if [ "${key_type}" == "EC" ]; then 
+  echo 'Create EC Key'
+  pkeyopt="-pkeyopt ec_paramgen_curve:${curve}"
+elif [ "${key_type}" == "RSA" ]; then
+  echo 'Create RSA Key'
+  pkeyopt="-pkeyopt rsa_keygen_bits:${rsa_bits}"
+elif [ "${key_type}" == "ED25519" ]; then
+  echo 'Create ED25519 Key'
+  pkeyopt=""
+else 
+  echo 'Key Type not found'
+fi
+
+############################################################
+#   Backup existing certs and create dir structure
+############################################################
+
+# if certs dir already exists, rename it so we don't overwrite anything important
+# but if it doesn't, then redirect the 'No such file or directory' error to null
+time_stamp=$(date +"%Y-%m-%d_%H-%M")
+mv $mosquitto_dir/certs $mosquitto_dir/certs-$time_stamp 2>/dev/null
+
+# create a sensible directory structure to store everything
+mkdir -p $mosquitto_dir/certs/{DH,CA,server,clients,csr_files}
+
+
+###########################################################
+# dhparamfile Creation
+###########################################################
+
+# Output DH parameters for safe prime group ffdhe2048
+openssl genpkey \
+-genparam \
+-algorithm DH \
+-pkeyopt group:ffdhe2048 \
+-out $mosquitto_dir/certs/DH/dhp_ffdhe2048.pem
+
+
+###########################################################
+# CA Creation
+###########################################################
+
+openssl genpkey \
+$algorithm $pkeyopt \
+-outform pem \
+-out $mosquitto_dir/certs/CA/ca_key.pem $encryption
+
+
+# Self sign the CA cert
+
+openssl req -x509 -new -key $mosquitto_dir/certs/CA/ca_key.pem -days 3650 \
+            -subj '/CN=MQTT CA' -outform pem -out $mosquitto_dir/certs/CA/ca_crt.pem
+
+
+###########################################################
+# Server Creation
+###########################################################
+
+# Create the Key
+openssl genpkey \
+$algorithm $pkeyopt \
+-outform pem \
+-out $mosquitto_dir/certs/server/server_key.pem
+
+# Create the certificate signing request (CSR)
+openssl req -new -subj "/CN=MQTT Server" \
+-addext "subjectAltName = ${subjectAltName}" \
+-nodes -key $mosquitto_dir/certs/server/server_key.pem -out $mosquitto_dir/certs/server/server_req.csr
+
+# Sign and authenticate it with the CA
+# We use copy_extensions to include the subjectAltNames from the CSR in the Server Cert
+openssl x509 -req -in $mosquitto_dir/certs/server/server_req.csr -copy_extensions copy -CA $mosquitto_dir/certs/CA/ca_crt.pem -CAkey $mosquitto_dir/certs/CA/ca_key.pem \
+-CAcreateserial -days 365 -outform pem -out $mosquitto_dir/certs/server/server_crt.pem
+
+
+###########################################################
+# Key and Cert Checking
+###########################################################
+
+# Examine the key to check that it looks OK
+openssl pkey -in $mosquitto_dir/certs/server/server_key.pem -text -noout
+
+# Examine the CSR
+openssl req -in $mosquitto_dir/certs/server/server_req.csr -noout -text
+
+# Validate the CA certificate
+openssl x509 -in $mosquitto_dir/certs/server/server_crt.pem -text -noout
+
+#clean up after the server cert creation
+mv $mosquitto_dir/certs/server/server_req.csr $mosquitto_dir/certs/csr_files
+
+###########################################################
+# Key Export and Read Permissions fix
+###########################################################
+
+#We need to export a copy of our CA Certificate in DER format for micropython.
+openssl x509 \
+-in $mosquitto_dir/certs/CA/ca_crt.pem \
+-out $mosquitto_dir/certs/CA/ca_crt.der \
+-outform DER
+
+# and save a copy of it somewhere useful
+cp $mosquitto_dir/certs/CA/ca_crt.der $mosquitto_dir/certs/clients
+
+# but pem based clients need the pem version of it too
+cp $mosquitto_dir/certs/CA/ca_crt.pem $mosquitto_dir/certs/clients
+
+# We also need to give read access to server_key.pem so it can be used by Mosquitto
+chmod 644 $mosquitto_dir/certs/server/server_key.pem
+
+
+# move the ca_maker script to certs/CA  and remove its execute permissions
+# to reduce the probability of running it by accident again
+# and overwriting everything in your certs directory
+#mv $mosquitto_dir/ca_maker $mosquitto_dir/certs/CA/ca_maker
+#chmod -x $mosquitto_dir/certs/CA/ca_maker
+
+# auto run the client_maker pem/der username
+#client_maker pem user1
+#client_maker pem user2
+#client_maker pem user3
+#client_maker der user4
